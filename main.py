@@ -1,15 +1,31 @@
-import yfinance as yf, time, datetime, os, requests, threading
+import yfinance as yf, time, datetime, os, requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "YOUR_CHAT_ID")
 last_signal = ""
 pcr_history = []
 
+# --- FIX FOR RENDER: Dummy server ---
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is Running")
+        def log_message(self, *args): return
+    print(f"Starting dummy server on {port}")
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+        print(f"Sent: {msg}")
     except: pass
 
 def get_pcr():
@@ -17,57 +33,38 @@ def get_pcr():
         s = requests.Session()
         s.get("https://www.nseindia.com", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         r = s.get("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        d = r.json()
-        ce = d['filtered']['CE']['totOI']; pe = d['filtered']['PE']['totOI']
-        return pe/ce if ce!=0 else 1.0
-    except: return 1.0
+        data = r.json()
+        ce_oi = sum([x['CE']['openInterest'] for x in data['records']['data'] if 'CE' in x and 'openInterest' in x['CE']][:20])
+        pe_oi = sum([x['PE']['openInterest'] for x in data['records']['data'] if 'PE' in x and 'openInterest' in x['PE']][:20])
+        if ce_oi > 0:
+            return pe_oi / ce_oi
+    except Exception as e:
+        print(f"PCR Error: {e}")
+    return 1.0
 
-def get_nifty():
+def get_blue():
     try:
-        df = yf.Ticker("^NSEI").history(period="1d", interval="5m")
-        c = float(df['Close'].iloc[-1])
-        b = float(df['Close'].ewm(span=20, adjust=False).mean().iloc[-1])
-        return c, b
-    except: return None, None
+        hist = yf.Ticker("^NSEI").history(period="1d", interval="5m")
+        if len(hist) > 20:
+            return hist['Close'].ewm(span=20).mean().iloc[-1], hist['Close'].iloc[-1]
+    except: pass
+    return None, None
 
-def wait_exact():
-    now = datetime.datetime.now()
-    nxt = ((now.minute // 5) + 1) * 5
-    if nxt >= 60:
-        nxt_t = now.replace(minute=0, second=5, microsecond=0) + datetime.timedelta(hours=1)
-    else:
-        nxt_t = now.replace(minute=nxt, second=5, microsecond=0)
-    sec = (nxt_t - now).total_seconds()
-    if sec < 0: sec += 300
-    print(f"Next check {nxt_t.strftime('%H:%M:%S')}")
-    time.sleep(sec)
-
-def run_server():
-    PORT = int(os.environ.get("PORT", 10000))
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot Running")
-    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
-
-threading.Thread(target=run_server, daemon=True).start()
-print("Bot Started")
-send_telegram("✅ Blue+PCR Bot Connected\nGREEN SELL PCR>=1.3 | RED BUY PCR<=0.8")
+# --- START ---
+send_telegram(f"✅ Blue+PCR Bot Connected\nGREEN SELL PCR>=1.3 | RED BUY PCR<=0.8\nTime: {datetime.datetime.now().strftime('%H:%M:%S')}")
 
 while True:
-    close, blue = get_nifty()
-    raw_pcr = get_pcr()
-    pcr_history.append(raw_pcr)
-    if len(pcr_history) > 20: pcr_history.pop(0)
-    pcr = sum(pcr_history)/len(pcr_history)
-    if close is None: time.sleep(30); continue
-    print(f"{datetime.datetime.now().strftime('%H:%M:%S')} Close:{close:.2f} Blue:{blue:.2f} PCR:{pcr:.2f}")
-    if close < blue and pcr >= 1.3:
-        if last_signal != "SELL":
-            send_telegram(f"🔴 SELL GREEN -> PE BUY\nPrice:{close:.2f} Blue:{blue:.2f} PCR:{pcr:.2f}")
-            last_signal="SELL"
-    elif close > blue and pcr <= 0.8:
-        if last_signal != "BUY":
-            send_telegram(f"🟢 BUY RED -> CE BUY\nPrice:{close:.2f} Blue:{blue:.2f} PCR:{pcr:.2f}")
-            last_signal="BUY"
-    else: print("WAIT")
-    wait_exact()
+    now = datetime.datetime.now()
+    if now.minute % 5 == 0 and now.second >= 5 and now.second <= 15:
+        blue, close = get_blue()
+        pcr = get_pcr()
+        if blue and close:
+            print(f"{now} Close:{close:.2f} Blue:{blue:.2f} PCR:{pcr:.2f}")
+            if close < blue and pcr >= 1.3 and last_signal != f"SELL_{now.minute}":
+                send_telegram(f"🔴 GREEN CANDLE SELL\nNIFTY {close:.2f} < Blue {blue:.2f}\nPCR {pcr:.2f} (>=1.3)\nPE BUY ✅\n{now.strftime('%H:%M:%S')}")
+                last_signal = f"SELL_{now.minute}"
+            elif close > blue and pcr <= 0.8 and last_signal != f"BUY_{now.minute}":
+                send_telegram(f"🟢 RED CANDLE BUY\nNIFTY {close:.2f} > Blue {blue:.2f}\nPCR {pcr:.2f} (<=0.8)\nCE BUY ✅\n{now.strftime('%H:%M:%S')}")
+                last_signal = f"BUY_{now.minute}"
+        time.sleep(65)
+    time.sleep(1)
